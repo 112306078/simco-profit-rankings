@@ -7,6 +7,7 @@ import socket
 import subprocess
 import time
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -39,8 +40,28 @@ def get_text(url):
         except subprocess.CalledProcessError as exc:
             last_error = exc
             if attempt < 6:
-                time.sleep(attempt * 2)
+                    time.sleep(attempt * 2)
     raise last_error
+
+
+def get_market_orders(resource_id):
+    url = f"{BASE}/api/v3/market/{REALM}/{resource_id}/"
+    result = subprocess.run(
+        ["curl", "-fsSL", "--connect-timeout", "2", "--max-time", "3", "-A", "Mozilla/5.0", url],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout)
+
+
+def timestamp_sort_key(timestamp):
+    if not timestamp:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def title_name(enum_name):
@@ -101,6 +122,7 @@ def q0_lowest_prices(resource_ids):
     raw_prices = data.get("prices", data)
     prices = {}
     timestamps = {}
+    price_sources = {}
 
     # Simco Tools currently returns a nested resource/quality price map.
     # Keep the parser permissive because its public API is still evolving.
@@ -124,6 +146,7 @@ def q0_lowest_prices(resource_ids):
             if price is not None:
                 prices[rid] = float(price)
                 timestamps[rid] = timestamp or ""
+                price_sources[rid] = "simcotools_market_prices"
     elif isinstance(raw_prices, list):
         for item in raw_prices:
             try:
@@ -137,29 +160,48 @@ def q0_lowest_prices(resource_ids):
             if price is not None:
                 prices[rid] = float(price)
                 timestamps[rid] = item.get("datetime") or item.get("date") or item.get("updatedAt") or item.get("lastUpdated") or ""
+                price_sources[rid] = "simcotools_market_prices"
 
-    missing = sorted(set(resource_ids) - set(prices))
-    if not missing:
-        return prices, timestamps
+    # Simco Tools batch prices can lag per resource. Use Sim Companies' market
+    # listings as the source of truth for current lowest Q0 exchange price.
+    market_prices = {}
+    market_timestamps = {}
+    market_failures = []
 
-    print(f"Simco Tools batch prices missing {len(missing)} ids; falling back for missing ids only.")
-    fallback_prices = {}
-    fallback_timestamps = {}
-    for idx, rid in enumerate(missing, 1):
-        orders = get_json(f"{BASE}/api/v3/market/{REALM}/{rid}/")
+    def fetch_market_price(rid):
+        try:
+            orders = get_market_orders(rid)
+        except Exception as exc:
+            return rid, None, "", str(exc)
         q0_orders = [o for o in orders if int(o.get("quality", -1)) == QUALITY]
         if q0_orders:
             best = min(q0_orders, key=lambda o: float(o["price"]))
-            fallback_prices[rid] = float(best["price"])
-            fallback_timestamps[rid] = best.get("posted") or best.get("datetimeDecayUpdated")
-        # Keep this polite: endpoint is public, but avoid a tight loop.
-        if idx % 10 == 0:
-            time.sleep(0.5)
+            return rid, float(best["price"]), best.get("posted") or best.get("datetimeDecayUpdated") or "", ""
+        return rid, None, "", "no Q0 market orders"
+
+    ordered_resource_ids = sorted(set(resource_ids), key=lambda rid: (timestamp_sort_key(timestamps.get(rid, "")), rid))
+    for rid in ordered_resource_ids:
+        rid, price, timestamp, error = fetch_market_price(rid)
+        if price is None:
+            market_failures.append({"resource_id": rid, "reason": error})
         else:
-            time.sleep(0.1)
-    prices.update(fallback_prices)
-    timestamps.update(fallback_timestamps)
-    return prices, timestamps
+            market_prices[rid] = price
+            market_timestamps[rid] = timestamp
+        time.sleep(0.05)
+
+    if market_prices:
+        prices.update(market_prices)
+        timestamps.update(market_timestamps)
+        for rid in market_prices:
+            price_sources[rid] = "simcompanies_market_listing"
+
+    if market_failures:
+        print(f"Market listing lookup failed for {len(market_failures)} ids; kept Simco Tools fallback when available.")
+
+    missing = sorted(set(resource_ids) - set(prices))
+    if missing:
+        print(f"Missing Q0 prices for {len(missing)} ids after market listing lookup; using available rows only.")
+    return prices, timestamps, price_sources, market_failures
 
 
 def main():
@@ -188,7 +230,7 @@ def main():
     input_ids.add(TRANSPORT_ID)
 
     print("Loading Q0 market prices...", flush=True)
-    prices, timestamps = q0_lowest_prices(input_ids)
+    prices, timestamps, price_sources, market_failures = q0_lowest_prices(input_ids)
     transport_price = prices.get(TRANSPORT_ID)
     if transport_price is None:
         raise RuntimeError("No Q0 transportation exchange price found.")
@@ -263,6 +305,7 @@ def main():
                 "building": building_code,
                 "exchange_q0_price": sell_price,
                 "price_timestamp": timestamps.get(rid, ""),
+                "price_source": price_sources.get(rid, ""),
                 "hourly_output_lvl1": hourly_output,
                 "material_unit_cost": material_unit_cost_exchange_inputs,
                 "material_unit_cost_exchange_inputs": material_unit_cost_exchange_inputs,
@@ -330,6 +373,8 @@ def main():
         "resources_ranked": len(rows),
         "non_seasonal_resources_ranked": len(non_seasonal_rows),
         "resources_skipped": skipped,
+        "market_listing_lookup_failed_count": len(market_failures),
+        "market_listing_lookup_failed": market_failures,
         "transport_q0_price": transport_price,
         "exchange_fee_percent": EXCHANGE_FEE_PERCENT,
         "contract_input_discount_percent": CONTRACT_INPUT_DISCOUNT_PERCENT,
